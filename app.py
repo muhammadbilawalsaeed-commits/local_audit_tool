@@ -1,14 +1,12 @@
 """
-Local Business Audit Tool (Phase 3 - Signup/Login added)
+Local Business Audit Tool (Phase 3 - English UI)
 ------------------------------------------------------------
-New in this version: real user accounts using Supabase Auth
-(free, no credit card, production-grade).
-
-Users must sign up / log in before they can use the audit tool.
-This is the foundation Phase 4 (Stripe subscription) will build on.
+Same functionality as before, all user-facing text in English
+for a global audience.
 """
 
 import re
+import time
 import requests
 import pandas as pd
 import streamlit as st
@@ -47,46 +45,46 @@ if "session" not in st.session_state:
 
 def show_auth_ui():
     st.title("🏪 Local Business Audit Tool")
-    st.caption("Continue karne ke liye login ya naya account banayein.")
+    st.caption("Please log in or create an account to continue.")
 
-    tab_login, tab_signup = st.tabs(["🔑 Login", "🆕 Sign Up"])
+    tab_login, tab_signup = st.tabs(["🔑 Log In", "🆕 Sign Up"])
 
     with tab_login:
         with st.form("login_form"):
             email = st.text_input("Email")
             password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Login", type="primary")
+            submitted = st.form_submit_button("Log In", type="primary")
             if submitted:
                 if not EMAIL_REGEX_SIMPLE.match(email):
-                    st.error("Sahi email likhein.")
+                    st.error("Please enter a valid email address.")
                 else:
                     try:
                         res = supabase.auth.sign_in_with_password({"email": email, "password": password})
                         st.session_state.user = res.user
                         st.session_state.session = res.session
                         st.rerun()
-                    except Exception as e:
-                        st.error("Login nahi hua. Email/password check karein ya pehle Sign Up karein.")
+                    except Exception:
+                        st.error("Login failed. Check your email/password, or sign up first.")
 
     with tab_signup:
         with st.form("signup_form"):
             email2 = st.text_input("Email", key="signup_email")
-            password2 = st.text_input("Password (kam az kam 6 characters)", type="password", key="signup_password")
+            password2 = st.text_input("Password (at least 6 characters)", type="password", key="signup_password")
             submitted2 = st.form_submit_button("Sign Up", type="primary")
             if submitted2:
                 if not EMAIL_REGEX_SIMPLE.match(email2):
-                    st.error("Sahi email likhein.")
+                    st.error("Please enter a valid email address.")
                 elif len(password2) < 6:
-                    st.error("Password kam az kam 6 characters ka hona chahiye.")
+                    st.error("Password must be at least 6 characters.")
                 else:
                     try:
                         supabase.auth.sign_up({"email": email2, "password": password2})
-                        st.success("Account ban gaya! Apna email check karein confirmation link ke liye, phir 'Login' tab se sign in karein.")
+                        st.success("Account created! Check your email for a confirmation link, then log in.")
                     except Exception as e:
-                        st.error(f"Sign up nahi hua: {e}")
+                        st.error(f"Sign up failed: {e}")
 
 
-# ------------------------- Audit tool logic (same as before) -------------------------
+# ------------------------- Audit tool logic -------------------------
 
 def text_search(query, api_key, max_pages=1):
     results = []
@@ -100,7 +98,6 @@ def text_search(query, api_key, max_pages=1):
         next_token = resp.get("next_page_token")
         if not next_token:
             break
-        import time
         time.sleep(2)
         params = {"pagetoken": next_token, "key": api_key}
     return results
@@ -178,7 +175,7 @@ def compute_health_score(details, pagespeed, onpage):
 def show_audit_tool():
     with st.sidebar:
         st.success(f"✅ Logged in as **{st.session_state.user.email}**")
-        if st.button("Logout"):
+        if st.button("Log Out"):
             supabase.auth.sign_out()
             st.session_state.user = None
             st.session_state.session = None
@@ -191,26 +188,26 @@ def show_audit_tool():
     st.title("🏪 Local Business Audit Tool")
     st.caption("Google Places + PageSpeed Insights (official APIs) — Local SEO Health Score.")
 
-    query = st.text_input("Business name + location", placeholder="e.g. Al-Fateh Bakers, Lahore")
+    query = st.text_input("Business name + location", placeholder="e.g. Starbucks, New York")
     run = st.button("🔍 Run Audit", type="primary")
 
     if run:
         if not places_api_key:
-            st.error("Sidebar mein Google Places API key daalein.")
+            st.error("Please enter your Google Places API key in the sidebar.")
         elif not query:
-            st.error("Business name aur location likhein.")
+            st.error("Please enter a business name and location.")
         else:
-            with st.spinner("Business dhoondi ja rahi hai..."):
+            with st.spinner("Searching for the business..."):
                 results = text_search(query, places_api_key)
 
             if not results:
-                st.warning("Koi result nahi mila. Query ya location badal kar dobara try karein.")
+                st.warning("No results found. Try a different name or location.")
             else:
                 options = {f"{r['name']} — {r.get('formatted_address', '')}": r["place_id"] for r in results[:5]}
-                chosen_label = st.selectbox("Sahi business chunain:", list(options.keys()))
+                chosen_label = st.selectbox("Select the correct business:", list(options.keys()))
                 place_id = options[chosen_label]
 
-                with st.spinner("Poora audit chal raha hai..."):
+                with st.spinner("Running full audit..."):
                     details = get_place_details(place_id, places_api_key)
                     website = details.get("website", "")
                     pagespeed = get_pagespeed_scores(website, pagespeed_api_key) if website else {}
@@ -252,7 +249,7 @@ def show_audit_tool():
                     ]
                     st.table(pd.DataFrame(onpage_rows, columns=["Check", "Status"]))
                 else:
-                    st.warning("Is business ki website Google par listed nahi hai.")
+                    st.warning("This business's website is not listed on Google — that's a great opportunity to pitch them!")
 
                 st.divider()
                 report_data = {
@@ -275,8 +272,8 @@ def show_audit_tool():
 
 if supabase is None:
     st.error(
-        "⚠️ Supabase configure nahi hua. `.streamlit/secrets.toml` file banayein "
-        "aur usme SUPABASE_URL aur SUPABASE_KEY dalen (README dekhein)."
+        "⚠️ Supabase is not configured. Please add SUPABASE_URL and SUPABASE_KEY "
+        "to your secrets (see README)."
     )
     st.stop()
 

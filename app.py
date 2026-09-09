@@ -1,15 +1,25 @@
 """
-Local Business Audit Tool (Phase 3 - English UI)
-------------------------------------------------------------
-Same functionality as before, all user-facing text in English
-for a global audience.
+Local Business Audit Tool (Phase 4 - Free Trial + Stripe Subscription)
+------------------------------------------------------------------------
+Flow:
+  1. User signs up / logs in (Supabase Auth).
+  2. On first login, a "profile" row is created with a 7-day free trial
+     (no card required to start).
+  3. While trial is active OR subscription is active -> full tool access.
+  4. When trial expires -> user is shown a "Subscribe" screen with a
+     Stripe Checkout link.
+  5. After payment, Stripe redirects back with a session_id; we verify
+     it and mark the user as an active subscriber in Supabase.
 """
 
 import re
 import time
+from datetime import datetime, timedelta, timezone
+
 import requests
 import pandas as pd
 import streamlit as st
+import stripe
 from supabase import create_client, Client
 
 st.set_page_config(page_title="Local Business Audit Tool", layout="wide")
@@ -21,31 +31,38 @@ PAGESPEED_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 EMAIL_REGEX_SIMPLE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
 
-# ------------------------- Supabase setup -------------------------
+# ------------------------- Setup -------------------------
 
 @st.cache_resource
 def init_supabase():
     try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
+        return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     except Exception:
         return None
-    if not url or not key:
-        return None
-    return create_client(url, key)
+
+
+def init_stripe():
+    try:
+        stripe.api_key = st.secrets["STRIPE_SECRET_KEY"]
+        return True
+    except Exception:
+        return False
 
 
 supabase: Client = init_supabase()
+stripe_ready = init_stripe()
 
 if "user" not in st.session_state:
     st.session_state.user = None
-if "session" not in st.session_state:
-    st.session_state.session = None
+if "profile" not in st.session_state:
+    st.session_state.profile = None
 
+
+# ------------------------- Auth UI -------------------------
 
 def show_auth_ui():
     st.title("🏪 Local Business Audit Tool")
-    st.caption("Please log in or create an account to continue.")
+    st.caption("Log in or sign up to start your free 7-day trial — no card required.")
 
     tab_login, tab_signup = st.tabs(["🔑 Log In", "🆕 Sign Up"])
 
@@ -53,15 +70,13 @@ def show_auth_ui():
         with st.form("login_form"):
             email = st.text_input("Email")
             password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Log In", type="primary")
-            if submitted:
+            if st.form_submit_button("Log In", type="primary"):
                 if not EMAIL_REGEX_SIMPLE.match(email):
                     st.error("Please enter a valid email address.")
                 else:
                     try:
                         res = supabase.auth.sign_in_with_password({"email": email, "password": password})
                         st.session_state.user = res.user
-                        st.session_state.session = res.session
                         st.rerun()
                     except Exception:
                         st.error("Login failed. Check your email/password, or sign up first.")
@@ -70,8 +85,7 @@ def show_auth_ui():
         with st.form("signup_form"):
             email2 = st.text_input("Email", key="signup_email")
             password2 = st.text_input("Password (at least 6 characters)", type="password", key="signup_password")
-            submitted2 = st.form_submit_button("Sign Up", type="primary")
-            if submitted2:
+            if st.form_submit_button("Sign Up", type="primary"):
                 if not EMAIL_REGEX_SIMPLE.match(email2):
                     st.error("Please enter a valid email address.")
                 elif len(password2) < 6:
@@ -82,6 +96,94 @@ def show_auth_ui():
                         st.success("Account created! Check your email for a confirmation link, then log in.")
                     except Exception as e:
                         st.error(f"Sign up failed: {e}")
+
+
+# ------------------------- Profile / trial / subscription logic -------------------------
+
+def get_or_create_profile(user):
+    resp = supabase.table("profiles").select("*").eq("id", user.id).execute()
+    if resp.data:
+        return resp.data[0]
+    trial_end = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+    new_profile = {"id": user.id, "email": user.email, "trial_end": trial_end, "subscription_status": "trialing"}
+    supabase.table("profiles").insert(new_profile).execute()
+    return new_profile
+
+
+def refresh_profile(user_id):
+    resp = supabase.table("profiles").select("*").eq("id", user_id).execute()
+    return resp.data[0] if resp.data else None
+
+
+def has_access(profile):
+    if not profile:
+        return False, None
+    if profile.get("subscription_status") == "active":
+        return True, "active"
+    trial_end_raw = profile.get("trial_end")
+    if trial_end_raw:
+        te = datetime.fromisoformat(trial_end_raw.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        if now < te:
+            days_left = (te - now).days
+            return True, f"trial ({days_left}d left)"
+    return False, "expired"
+
+
+def create_checkout_session(user_email):
+    app_url = st.secrets.get("APP_URL", "")
+    price_id = st.secrets.get("STRIPE_PRICE_ID", "")
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer_email=user_email,
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=f"{app_url}?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{app_url}?checkout=cancelled",
+    )
+    return session
+
+
+def handle_checkout_return(user_id):
+    params = st.query_params
+    if params.get("checkout") == "success" and params.get("session_id"):
+        session_id = params.get("session_id")
+        try:
+            session = stripe.checkout.Session.retrieve(session_id)
+            if session.status == "complete":
+                supabase.table("profiles").update({
+                    "subscription_status": "active",
+                    "stripe_customer_id": session.customer,
+                    "stripe_subscription_id": session.subscription,
+                }).eq("id", user_id).execute()
+                st.query_params.clear()
+                st.success("🎉 Subscription activated! Welcome aboard.")
+                time.sleep(1.5)
+                st.rerun()
+        except Exception as e:
+            st.error(f"Could not verify payment: {e}")
+
+
+def show_subscribe_screen(user):
+    st.title("🏪 Local Business Audit Tool")
+    st.warning("Your free trial has ended. Subscribe to keep using the tool.")
+    st.markdown("### Local Audit Tool — Pro Plan")
+    st.markdown("Unlimited local business audits, Google Business Profile checks, and website health reports.")
+
+    if stripe_ready and st.secrets.get("STRIPE_PRICE_ID"):
+        if st.button("💳 Subscribe Now", type="primary"):
+            try:
+                session = create_checkout_session(user.email)
+                st.link_button("➡️ Click here to complete payment", session.url, type="primary")
+            except Exception as e:
+                st.error(f"Could not start checkout: {e}")
+    else:
+        st.info("Payments are not configured yet.")
+
+    if st.button("Log Out"):
+        supabase.auth.sign_out()
+        st.session_state.user = None
+        st.session_state.profile = None
+        st.rerun()
 
 
 # ------------------------- Audit tool logic -------------------------
@@ -172,13 +274,14 @@ def compute_health_score(details, pagespeed, onpage):
     return round((score / max_score) * 100)
 
 
-def show_audit_tool():
+def show_audit_tool(user, access_label):
     with st.sidebar:
-        st.success(f"✅ Logged in as **{st.session_state.user.email}**")
+        st.success(f"✅ Logged in as **{user.email}**")
+        st.caption(f"Plan status: {access_label}")
         if st.button("Log Out"):
             supabase.auth.sign_out()
             st.session_state.user = None
-            st.session_state.session = None
+            st.session_state.profile = None
             st.rerun()
         st.divider()
         st.header("Settings")
@@ -271,13 +374,19 @@ def show_audit_tool():
 # ------------------------- Main -------------------------
 
 if supabase is None:
-    st.error(
-        "⚠️ Supabase is not configured. Please add SUPABASE_URL and SUPABASE_KEY "
-        "to your secrets (see README)."
-    )
+    st.error("⚠️ Supabase is not configured. Please check your secrets.")
     st.stop()
 
 if st.session_state.user is None:
     show_auth_ui()
+    st.stop()
+
+user = st.session_state.user
+handle_checkout_return(user.id)
+profile = get_or_create_profile(user)
+allowed, access_label = has_access(profile)
+
+if allowed:
+    show_audit_tool(user, access_label)
 else:
-    show_audit_tool()
+    show_subscribe_screen(user)

@@ -1,19 +1,18 @@
 """
-Local Business Audit Tool (Phase 4 - Free Trial + Stripe Subscription)
-------------------------------------------------------------------------
-Flow:
-  1. User signs up / logs in (Supabase Auth).
-  2. On first login, a "profile" row is created with a 7-day free trial
-     (no card required to start).
-  3. While trial is active OR subscription is active -> full tool access.
-  4. When trial expires -> user is shown a "Subscribe" screen with a
-     Stripe Checkout link.
-  5. After payment, Stripe redirects back with a session_id; we verify
-     it and mark the user as an active subscriber in Supabase.
+Local Business Audit Tool (Phase 6 - Auto-Email + Follow-up Log)
+------------------------------------------------------------------
+New in this version:
+  - After an audit, send a one-click outreach email (via Gmail SMTP)
+    pitching your services to the business, pre-filled with their score.
+  - Every sent email is logged in Supabase.
+  - An "Outreach Log" screen lists all sent emails with a status you can
+    update (Sent / Opened / Replied / No Response) as you hear back.
 """
 
 import re
 import time
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -29,6 +28,7 @@ PLACES_DETAILS = "https://maps.googleapis.com/maps/api/place/details/json"
 PAGESPEED_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 
 EMAIL_REGEX_SIMPLE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+STATUS_OPTIONS = ["sent", "opened", "replied", "no response"]
 
 
 # ------------------------- Setup -------------------------
@@ -54,8 +54,8 @@ stripe_ready = init_stripe()
 
 if "user" not in st.session_state:
     st.session_state.user = None
-if "profile" not in st.session_state:
-    st.session_state.profile = None
+if "view" not in st.session_state:
+    st.session_state.view = "Audit Tool"
 
 
 # ------------------------- Auth UI -------------------------
@@ -98,7 +98,7 @@ def show_auth_ui():
                         st.error(f"Sign up failed: {e}")
 
 
-# ------------------------- Profile / trial / subscription logic -------------------------
+# ------------------------- Profile / trial / subscription -------------------------
 
 def get_or_create_profile(user):
     resp = supabase.table("profiles").select("*").eq("id", user.id).execute()
@@ -108,11 +108,6 @@ def get_or_create_profile(user):
     new_profile = {"id": user.id, "email": user.email, "trial_end": trial_end, "subscription_status": "trialing"}
     supabase.table("profiles").insert(new_profile).execute()
     return new_profile
-
-
-def refresh_profile(user_id):
-    resp = supabase.table("profiles").select("*").eq("id", user_id).execute()
-    return resp.data[0] if resp.data else None
 
 
 def has_access(profile):
@@ -182,7 +177,6 @@ def show_subscribe_screen(user):
     if st.button("Log Out"):
         supabase.auth.sign_out()
         st.session_state.user = None
-        st.session_state.profile = None
         st.rerun()
 
 
@@ -274,19 +268,125 @@ def compute_health_score(details, pagespeed, onpage):
     return round((score / max_score) * 100)
 
 
+# ------------------------- Email outreach -------------------------
+
+def default_email_template(business_name, health_score):
+    subject = f"Quick note about {business_name}'s online presence"
+    body = (
+        f"Hi there,\n\n"
+        f"I ran a quick audit of {business_name}'s online presence and found a few "
+        f"opportunities to improve your visibility on Google — your current score is "
+        f"{health_score}/100.\n\n"
+        f"I help local businesses fix exactly these kinds of issues (Google Business "
+        f"Profile, website speed, SEO basics) so more customers find you.\n\n"
+        f"Would you be open to a quick 10-minute call this week to walk through what "
+        f"I found?\n\n"
+        f"Best,\n"
+        f"[Your Name]"
+    )
+    return subject, body
+
+
+def send_email_smtp(to_email, subject, body):
+    gmail_address = st.secrets.get("GMAIL_ADDRESS", "")
+    gmail_password = st.secrets.get("GMAIL_APP_PASSWORD", "")
+    if not gmail_address or not gmail_password:
+        raise Exception("Gmail is not configured in secrets.")
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = gmail_address
+    msg["To"] = to_email
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(gmail_address, gmail_password)
+        server.sendmail(gmail_address, [to_email], msg.as_string())
+
+
+def log_outreach_email(user_id, business_name, recipient_email, subject, body, health_score):
+    supabase.table("outreach_emails").insert({
+        "user_id": user_id,
+        "business_name": business_name,
+        "recipient_email": recipient_email,
+        "subject": subject,
+        "body": body,
+        "health_score": health_score,
+        "status": "sent",
+    }).execute()
+
+
+def show_outreach_form(user_id, business_name, health_score):
+    with st.expander("📧 Send Outreach Email to This Business"):
+        default_subject, default_body = default_email_template(business_name, health_score)
+        recipient = st.text_input("Recipient email address", key=f"recipient_{business_name}")
+        subject = st.text_input("Subject", value=default_subject, key=f"subject_{business_name}")
+        body = st.text_area("Message", value=default_body, height=220, key=f"body_{business_name}")
+        if st.button("📤 Send Email", key=f"send_{business_name}"):
+            if not EMAIL_REGEX_SIMPLE.match(recipient):
+                st.error("Please enter a valid recipient email address.")
+            else:
+                try:
+                    send_email_smtp(recipient, subject, body)
+                    log_outreach_email(user_id, business_name, recipient, subject, body, health_score)
+                    st.success(f"Email sent to {recipient} and logged!")
+                except Exception as e:
+                    st.error(f"Could not send email: {e}")
+
+
+# ------------------------- Outreach log screen -------------------------
+
+def show_outreach_log(user_id):
+    st.title("📋 Outreach Log")
+    st.caption("Every email you've sent. Update the status as you hear back.")
+
+    resp = supabase.table("outreach_emails").select("*").eq("user_id", user_id).order("sent_at", desc=True).execute()
+    emails = resp.data
+
+    if not emails:
+        st.info("No outreach emails sent yet. Run an audit and send an email to see it here.")
+        return
+
+    for e in emails:
+        with st.container(border=True):
+            col1, col2, col3 = st.columns([3, 2, 2])
+            with col1:
+                st.write(f"**{e.get('business_name', '')}**")
+                st.caption(f"To: {e.get('recipient_email', '')}")
+                st.caption(f"Subject: {e.get('subject', '')}")
+            with col2:
+                st.write(f"Score: {e.get('health_score', 'N/A')}/100")
+                sent_at = e.get("sent_at", "")
+                st.caption(f"Sent: {sent_at[:10] if sent_at else ''}")
+            with col3:
+                current_status = e.get("status", "sent")
+                new_status = st.selectbox(
+                    "Status", STATUS_OPTIONS,
+                    index=STATUS_OPTIONS.index(current_status) if current_status in STATUS_OPTIONS else 0,
+                    key=f"status_{e['id']}",
+                    label_visibility="collapsed",
+                )
+                if new_status != current_status:
+                    supabase.table("outreach_emails").update({"status": new_status}).eq("id", e["id"]).execute()
+                    st.rerun()
+
+
+# ------------------------- Main audit tool screen -------------------------
+
 def show_audit_tool(user, access_label):
     with st.sidebar:
         st.success(f"✅ Logged in as **{user.email}**")
         st.caption(f"Plan status: {access_label}")
+        st.session_state.view = st.radio("View", ["Audit Tool", "Outreach Log"], index=0 if st.session_state.view == "Audit Tool" else 1)
         if st.button("Log Out"):
             supabase.auth.sign_out()
             st.session_state.user = None
-            st.session_state.profile = None
             st.rerun()
         st.divider()
         st.header("Settings")
         places_api_key = st.text_input("Google Places API Key", type="password")
         pagespeed_api_key = st.text_input("PageSpeed API Key (optional)", type="password")
+
+    if st.session_state.view == "Outreach Log":
+        show_outreach_log(user.id)
+        return
 
     st.title("🏪 Local Business Audit Tool")
     st.caption("Google Places + PageSpeed Insights (official APIs) — Local SEO Health Score.")
@@ -306,69 +406,90 @@ def show_audit_tool(user, access_label):
             if not results:
                 st.warning("No results found. Try a different name or location.")
             else:
-                options = {f"{r['name']} — {r.get('formatted_address', '')}": r["place_id"] for r in results[:5]}
-                chosen_label = st.selectbox("Select the correct business:", list(options.keys()))
-                place_id = options[chosen_label]
+                st.session_state["last_results"] = results
 
-                with st.spinner("Running full audit..."):
-                    details = get_place_details(place_id, places_api_key)
-                    website = details.get("website", "")
-                    pagespeed = get_pagespeed_scores(website, pagespeed_api_key) if website else {}
-                    onpage = check_onpage_basics(website) if website else {}
-                    health_score = compute_health_score(details, pagespeed, onpage)
+    results = st.session_state.get("last_results")
+    if results:
+        options = {f"{r['name']} — {r.get('formatted_address', '')}": r["place_id"] for r in results[:5]}
+        chosen_label = st.selectbox("Select the correct business:", list(options.keys()))
+        place_id = options[chosen_label]
 
-                col1, col2 = st.columns([1, 2])
-                with col1:
-                    st.metric("Local SEO Health Score", f"{health_score}/100")
-                with col2:
-                    st.write(f"**{details.get('name', '')}**")
-                    st.write(details.get("formatted_address", ""))
-                    st.write(f"⭐ {details.get('rating', 'N/A')} ({details.get('user_ratings_total', 0)} reviews)")
+        if st.button("Run Full Audit on Selected Business"):
+            places_api_key_local = places_api_key
+            with st.spinner("Running full audit..."):
+                details = get_place_details(place_id, places_api_key_local)
+                website = details.get("website", "")
+                pagespeed = get_pagespeed_scores(website, pagespeed_api_key) if website else {}
+                onpage = check_onpage_basics(website) if website else {}
+                health_score = compute_health_score(details, pagespeed, onpage)
+            st.session_state["last_audit"] = {
+                "details": details, "website": website, "pagespeed": pagespeed,
+                "onpage": onpage, "health_score": health_score,
+            }
 
-                st.divider()
-                st.subheader("📍 Google Business Profile")
-                gbp_rows = [
-                    ("Website listed", "✅" if details.get("website") else "❌"),
-                    ("Phone number listed", "✅" if details.get("formatted_phone_number") else "❌"),
-                    ("Opening hours set", "✅" if details.get("opening_hours") else "❌"),
-                    ("Rating ≥ 4.0", "✅" if details.get("rating", 0) >= 4.0 else "❌"),
-                ]
-                st.table(pd.DataFrame(gbp_rows, columns=["Check", "Status"]))
+    audit = st.session_state.get("last_audit")
+    if audit:
+        details = audit["details"]
+        website = audit["website"]
+        pagespeed = audit["pagespeed"]
+        onpage = audit["onpage"]
+        health_score = audit["health_score"]
 
-                if website:
-                    st.subheader("🌐 Website Technical Health")
-                    ps_cols = st.columns(4)
-                    labels = {"performance": "Performance", "seo": "SEO", "accessibility": "Accessibility", "best_practices": "Best Practices"}
-                    for i, key in enumerate(["performance", "seo", "accessibility", "best_practices"]):
-                        val = pagespeed.get(key)
-                        ps_cols[i].metric(labels[key], f"{val}/100" if val is not None else "N/A")
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            st.metric("Local SEO Health Score", f"{health_score}/100")
+        with col2:
+            st.write(f"**{details.get('name', '')}**")
+            st.write(details.get("formatted_address", ""))
+            st.write(f"⭐ {details.get('rating', 'N/A')} ({details.get('user_ratings_total', 0)} reviews)")
 
-                    st.subheader("🔎 On-Page Basics")
-                    onpage_rows = [
-                        ("HTTPS (secure)", "✅" if onpage.get("https") else "❌"),
-                        ("Title tag present", "✅" if onpage.get("title_tag") else "❌"),
-                        ("Meta description present", "✅" if onpage.get("meta_description") else "❌"),
-                        ("Mobile-friendly viewport tag", "✅" if onpage.get("mobile_viewport") else "❌"),
-                    ]
-                    st.table(pd.DataFrame(onpage_rows, columns=["Check", "Status"]))
-                else:
-                    st.warning("This business's website is not listed on Google — that's a great opportunity to pitch them!")
+        st.divider()
+        st.subheader("📍 Google Business Profile")
+        gbp_rows = [
+            ("Website listed", "✅" if details.get("website") else "❌"),
+            ("Phone number listed", "✅" if details.get("formatted_phone_number") else "❌"),
+            ("Opening hours set", "✅" if details.get("opening_hours") else "❌"),
+            ("Rating ≥ 4.0", "✅" if details.get("rating", 0) >= 4.0 else "❌"),
+        ]
+        st.table(pd.DataFrame(gbp_rows, columns=["Check", "Status"]))
 
-                st.divider()
-                report_data = {
-                    "Business Name": [details.get("name", "")],
-                    "Address": [details.get("formatted_address", "")],
-                    "Phone": [details.get("formatted_phone_number", "")],
-                    "Website": [website],
-                    "Rating": [details.get("rating", "")],
-                    "Reviews": [details.get("user_ratings_total", "")],
-                    "Health Score": [health_score],
-                }
-                df_report = pd.DataFrame(report_data)
-                csv = df_report.to_csv(index=False).encode("utf-8-sig")
-                st.download_button("⬇️ Download Audit Report (CSV)", data=csv,
-                                    file_name=f"audit_{details.get('name', 'business').replace(' ', '_')}.csv",
-                                    mime="text/csv")
+        if website:
+            st.subheader("🌐 Website Technical Health")
+            ps_cols = st.columns(4)
+            labels = {"performance": "Performance", "seo": "SEO", "accessibility": "Accessibility", "best_practices": "Best Practices"}
+            for i, key in enumerate(["performance", "seo", "accessibility", "best_practices"]):
+                val = pagespeed.get(key)
+                ps_cols[i].metric(labels[key], f"{val}/100" if val is not None else "N/A")
+
+            st.subheader("🔎 On-Page Basics")
+            onpage_rows = [
+                ("HTTPS (secure)", "✅" if onpage.get("https") else "❌"),
+                ("Title tag present", "✅" if onpage.get("title_tag") else "❌"),
+                ("Meta description present", "✅" if onpage.get("meta_description") else "❌"),
+                ("Mobile-friendly viewport tag", "✅" if onpage.get("mobile_viewport") else "❌"),
+            ]
+            st.table(pd.DataFrame(onpage_rows, columns=["Check", "Status"]))
+        else:
+            st.warning("This business's website is not listed on Google — that's a great opportunity to pitch them!")
+
+        st.divider()
+        report_data = {
+            "Business Name": [details.get("name", "")],
+            "Address": [details.get("formatted_address", "")],
+            "Phone": [details.get("formatted_phone_number", "")],
+            "Website": [website],
+            "Rating": [details.get("rating", "")],
+            "Reviews": [details.get("user_ratings_total", "")],
+            "Health Score": [health_score],
+        }
+        df_report = pd.DataFrame(report_data)
+        csv = df_report.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("⬇️ Download Audit Report (CSV)", data=csv,
+                            file_name=f"audit_{details.get('name', 'business').replace(' ', '_')}.csv",
+                            mime="text/csv")
+
+        st.divider()
+        show_outreach_form(user.id, details.get("name", "this business"), health_score)
 
 
 # ------------------------- Main -------------------------

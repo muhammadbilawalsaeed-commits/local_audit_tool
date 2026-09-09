@@ -331,6 +331,110 @@ def show_outreach_form(user_id, business_name, health_score):
                     st.error(f"Could not send email: {e}")
 
 
+# ------------------------- Bulk audit mode -------------------------
+
+def run_single_audit(business_query, places_api_key, pagespeed_api_key):
+    """Runs a full audit for one business query string, returns a flat dict or None."""
+    results = text_search(business_query, places_api_key)
+    if not results:
+        return None
+    place_id = results[0]["place_id"]
+    details = get_place_details(place_id, places_api_key)
+    website = details.get("website", "")
+    pagespeed = get_pagespeed_scores(website, pagespeed_api_key) if website else {}
+    onpage = check_onpage_basics(website) if website else {}
+    health_score = compute_health_score(details, pagespeed, onpage)
+    return {
+        "Business Name": details.get("name", ""),
+        "Address": details.get("formatted_address", ""),
+        "Phone": details.get("formatted_phone_number", ""),
+        "Website": website,
+        "Rating": details.get("rating", ""),
+        "Reviews": details.get("user_ratings_total", ""),
+        "Health Score": health_score,
+    }
+
+
+def show_bulk_audit(user, places_api_key, pagespeed_api_key):
+    st.title("📦 Bulk Audit Mode")
+    st.caption("Upload a CSV of businesses (e.g. from your Lead Generation tool) and audit them all at once.")
+
+    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    if not uploaded:
+        st.info("CSV should have at least a business name column. A location/address column and an email column are optional but recommended.")
+        return
+
+    df_input = pd.read_csv(uploaded)
+    st.write("Preview:")
+    st.dataframe(df_input.head(), use_container_width=True)
+
+    cols = list(df_input.columns)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        name_col = st.selectbox("Business name column", cols)
+    with col2:
+        location_col = st.selectbox("Location column (optional)", ["(none)"] + cols)
+    with col3:
+        email_col = st.selectbox("Email column (optional, for outreach)", ["(none)"] + cols)
+
+    max_rows = st.slider("How many rows to audit (limits API usage)", 1, min(50, len(df_input)), min(10, len(df_input)))
+
+    if st.button("🚀 Run Bulk Audit", type="primary"):
+        if not places_api_key:
+            st.error("Please enter your Google Places API key in the sidebar.")
+            return
+
+        rows_to_process = df_input.head(max_rows)
+        progress = st.progress(0.0, text="Starting...")
+        results = []
+        for i, row in rows_to_process.iterrows():
+            name = str(row[name_col])
+            location = str(row[location_col]) if location_col != "(none)" else ""
+            query = f"{name} {location}".strip()
+            try:
+                result = run_single_audit(query, places_api_key, pagespeed_api_key)
+            except Exception:
+                result = None
+            if result:
+                if email_col != "(none)":
+                    result["Email"] = row.get(email_col, "")
+                results.append(result)
+            progress.progress((i + 1) / len(rows_to_process), text=f"Audited {i + 1}/{len(rows_to_process)}")
+        progress.empty()
+
+        if not results:
+            st.warning("No results. Check your API key or column selection.")
+            return
+
+        df_results = pd.DataFrame(results)
+        st.session_state["bulk_results"] = df_results
+        st.success(f"Audited {len(df_results)} businesses!")
+
+    df_results = st.session_state.get("bulk_results")
+    if df_results is not None:
+        st.dataframe(df_results, use_container_width=True)
+        csv = df_results.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("⬇️ Download Bulk Report (CSV)", data=csv, file_name="bulk_audit_report.csv", mime="text/csv")
+
+        if "Email" in df_results.columns:
+            st.divider()
+            st.subheader("📤 Bulk Outreach")
+            threshold = st.slider("Send outreach to businesses with score below:", 0, 100, 60)
+            low_score = df_results[(df_results["Health Score"] < threshold) & (df_results["Email"].notna()) & (df_results["Email"] != "")]
+            st.write(f"{len(low_score)} businesses match (score below {threshold} and have an email).")
+            if len(low_score) > 0 and st.button(f"Send outreach email to all {len(low_score)} businesses"):
+                sent_count = 0
+                for _, row in low_score.iterrows():
+                    subject, body = default_email_template(row["Business Name"], row["Health Score"])
+                    try:
+                        send_email_smtp(row["Email"], subject, body)
+                        log_outreach_email(user.id, row["Business Name"], row["Email"], subject, body, row["Health Score"])
+                        sent_count += 1
+                    except Exception:
+                        pass
+                st.success(f"Sent {sent_count}/{len(low_score)} outreach emails. Check the Outreach Log tab.")
+
+
 # ------------------------- Outreach log screen -------------------------
 
 def show_outreach_log(user_id):
@@ -374,7 +478,8 @@ def show_audit_tool(user, access_label):
     with st.sidebar:
         st.success(f"✅ Logged in as **{user.email}**")
         st.caption(f"Plan status: {access_label}")
-        st.session_state.view = st.radio("View", ["Audit Tool", "Outreach Log"], index=0 if st.session_state.view == "Audit Tool" else 1)
+        views = ["Audit Tool", "Bulk Audit", "Outreach Log"]
+        st.session_state.view = st.radio("View", views, index=views.index(st.session_state.view) if st.session_state.view in views else 0)
         if st.button("Log Out"):
             supabase.auth.sign_out()
             st.session_state.user = None
@@ -386,6 +491,10 @@ def show_audit_tool(user, access_label):
 
     if st.session_state.view == "Outreach Log":
         show_outreach_log(user.id)
+        return
+
+    if st.session_state.view == "Bulk Audit":
+        show_bulk_audit(user, places_api_key, pagespeed_api_key)
         return
 
     st.title("🏪 Local Business Audit Tool")

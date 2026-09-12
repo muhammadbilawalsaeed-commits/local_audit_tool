@@ -1,19 +1,18 @@
 """
-Local Business Audit Tool (Phase 6 - Auto-Email + Follow-up Log)
-------------------------------------------------------------------
-New in this version:
-  - After an audit, send a one-click outreach email (via Gmail SMTP)
-    pitching your services to the business, pre-filled with their score.
-  - Every sent email is logged in Supabase.
-  - An "Outreach Log" screen lists all sent emails with a status you can
-    update (Sent / Opened / Replied / No Response) as you hear back.
+Local Business Audit Tool (Phase 7 - Free Data Source + Polished Design)
+---------------------------------------------------------------------------
+Key change: business search now uses OpenStreetMap's free Nominatim API
+instead of Google Places, so NO billing account is required to run this
+tool. Google Places can be added back later as a premium data source once
+billing is sorted out — the audit/scoring/email/subscription logic below
+does not depend on which search source is used.
 """
 
 import re
 import time
+from datetime import datetime, timedelta, timezone
 import smtplib
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta, timezone
 
 import requests
 import pandas as pd
@@ -21,14 +20,56 @@ import streamlit as st
 import stripe
 from supabase import create_client, Client
 
-st.set_page_config(page_title="Local Business Audit Tool", layout="wide")
+st.set_page_config(page_title="Local Business Audit Tool", layout="wide", page_icon="🏪")
 
-PLACES_TEXT_SEARCH = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-PLACES_DETAILS = "https://maps.googleapis.com/maps/api/place/details/json"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 PAGESPEED_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+NOMINATIM_HEADERS = {"User-Agent": "LocalBusinessAuditTool/1.0 (contact: owner)"}
 
 EMAIL_REGEX_SIMPLE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 STATUS_OPTIONS = ["sent", "opened", "replied", "no response"]
+
+
+# ------------------------- Custom design -------------------------
+
+def inject_custom_css():
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
+
+        html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+        h1, h2, h3 { font-family: 'Space Grotesk', sans-serif; letter-spacing: -0.01em; }
+
+        .score-card {
+            background: #FFFFFF;
+            border: 1px solid #E4E1D8;
+            border-radius: 10px;
+            padding: 1.5rem;
+        }
+        .score-number {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 3rem;
+            font-weight: 700;
+            line-height: 1;
+        }
+        .score-good { color: #0F6E5B; }
+        .score-mid { color: #B3541E; }
+        .score-bad { color: #A3352B; }
+
+        div[data-testid="stMetricValue"] { font-family: 'Space Grotesk', sans-serif; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def score_color_class(score):
+    if score >= 75:
+        return "score-good"
+    elif score >= 45:
+        return "score-mid"
+    return "score-bad"
 
 
 # ------------------------- Setup -------------------------
@@ -64,7 +105,7 @@ def show_auth_ui():
     st.title("🏪 Local Business Audit Tool")
     st.caption("Log in or sign up to start your free 7-day trial — no card required.")
 
-    tab_login, tab_signup = st.tabs(["🔑 Log In", "🆕 Sign Up"])
+    tab_login, tab_signup = st.tabs(["Log In", "Sign Up"])
 
     with tab_login:
         with st.form("login_form"):
@@ -162,13 +203,13 @@ def show_subscribe_screen(user):
     st.title("🏪 Local Business Audit Tool")
     st.warning("Your free trial has ended. Subscribe to keep using the tool.")
     st.markdown("### Local Audit Tool — Pro Plan")
-    st.markdown("Unlimited local business audits, Google Business Profile checks, and website health reports.")
+    st.markdown("Unlimited local business audits, website health reports, and outreach tools.")
 
     if stripe_ready and st.secrets.get("STRIPE_PRICE_ID"):
-        if st.button("💳 Subscribe Now", type="primary"):
+        if st.button("Subscribe Now", type="primary"):
             try:
                 session = create_checkout_session(user.email)
-                st.link_button("➡️ Click here to complete payment", session.url, type="primary")
+                st.link_button("Complete payment", session.url, type="primary")
             except Exception as e:
                 st.error(f"Could not start checkout: {e}")
     else:
@@ -180,30 +221,39 @@ def show_subscribe_screen(user):
         st.rerun()
 
 
-# ------------------------- Audit tool logic -------------------------
+# ------------------------- Free data source: OpenStreetMap -------------------------
 
-def text_search(query, api_key, max_pages=1):
-    results = []
-    params = {"query": query, "key": api_key}
-    for _ in range(max_pages):
-        resp = requests.get(PLACES_TEXT_SEARCH, params=params, timeout=15).json()
-        if resp.get("status") not in ("OK", "ZERO_RESULTS"):
-            st.warning(f"API status: {resp.get('status')} - {resp.get('error_message', '')}")
-            break
-        results.extend(resp.get("results", []))
-        next_token = resp.get("next_page_token")
-        if not next_token:
-            break
-        time.sleep(2)
-        params = {"pagetoken": next_token, "key": api_key}
-    return results
+def search_business(query, max_results=5):
+    """Search businesses using OpenStreetMap's free Nominatim API. No API key or billing needed."""
+    params = {
+        "q": query,
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "extratags": 1,
+        "limit": max_results,
+    }
+    try:
+        resp = requests.get(NOMINATIM_URL, params=params, headers=NOMINATIM_HEADERS, timeout=15)
+        time.sleep(1)  # respect Nominatim's 1 request/second usage policy
+        return resp.json()
+    except Exception:
+        return []
 
 
-def get_place_details(place_id, api_key):
-    fields = "name,formatted_address,formatted_phone_number,website,rating,user_ratings_total,opening_hours,business_status,url"
-    params = {"place_id": place_id, "fields": fields, "key": api_key}
-    resp = requests.get(PLACES_DETAILS, params=params, timeout=15).json()
-    return resp.get("result", {})
+def parse_business_result(result):
+    extratags = result.get("extratags", {}) or {}
+    address = result.get("address", {}) or {}
+    name = result.get("name") or result.get("display_name", "").split(",")[0]
+    website = extratags.get("website") or extratags.get("contact:website", "")
+    phone = extratags.get("phone") or extratags.get("contact:phone", "")
+    opening_hours = extratags.get("opening_hours", "")
+    return {
+        "name": name,
+        "formatted_address": result.get("display_name", ""),
+        "website": website,
+        "phone": phone,
+        "opening_hours": opening_hours,
+    }
 
 
 def get_pagespeed_scores(url, api_key=None):
@@ -242,23 +292,22 @@ def check_onpage_basics(url, timeout=8):
     return checks
 
 
-def compute_health_score(details, pagespeed, onpage):
+def compute_health_score(business, pagespeed, onpage):
+    """Weights rebalanced since OSM data has no ratings field (unlike Google)."""
     score = 0
     max_score = 0
-    max_score += 30
-    if details.get("website"):
-        score += 8
-    if details.get("formatted_phone_number"):
-        score += 7
-    if details.get("opening_hours"):
-        score += 7
-    if details.get("rating", 0) and details.get("rating", 0) >= 4.0:
-        score += 8
+    max_score += 20
+    if business.get("website"):
+        score += 10
+    if business.get("phone"):
+        score += 5
+    if business.get("opening_hours"):
+        score += 5
     for key in ["performance", "seo", "accessibility", "best_practices"]:
-        max_score += 10
+        max_score += 12.5
         val = pagespeed.get(key)
         if val is not None:
-            score += (val / 100) * 10
+            score += (val / 100) * 12.5
     for key in ["https", "title_tag", "meta_description", "mobile_viewport"]:
         max_score += 7.5
         if onpage.get(key):
@@ -275,10 +324,10 @@ def default_email_template(business_name, health_score):
     body = (
         f"Hi there,\n\n"
         f"I ran a quick audit of {business_name}'s online presence and found a few "
-        f"opportunities to improve your visibility on Google — your current score is "
+        f"opportunities to improve your visibility online — your current score is "
         f"{health_score}/100.\n\n"
-        f"I help local businesses fix exactly these kinds of issues (Google Business "
-        f"Profile, website speed, SEO basics) so more customers find you.\n\n"
+        f"I help local businesses fix exactly these kinds of issues (website speed, "
+        f"SEO basics, online listings) so more customers find you.\n\n"
         f"Would you be open to a quick 10-minute call this week to walk through what "
         f"I found?\n\n"
         f"Best,\n"
@@ -314,12 +363,12 @@ def log_outreach_email(user_id, business_name, recipient_email, subject, body, h
 
 
 def show_outreach_form(user_id, business_name, health_score):
-    with st.expander("📧 Send Outreach Email to This Business"):
+    with st.expander("Send Outreach Email to This Business"):
         default_subject, default_body = default_email_template(business_name, health_score)
         recipient = st.text_input("Recipient email address", key=f"recipient_{business_name}")
         subject = st.text_input("Subject", value=default_subject, key=f"subject_{business_name}")
         body = st.text_area("Message", value=default_body, height=220, key=f"body_{business_name}")
-        if st.button("📤 Send Email", key=f"send_{business_name}"):
+        if st.button("Send Email", key=f"send_{business_name}"):
             if not EMAIL_REGEX_SIMPLE.match(recipient):
                 st.error("Please enter a valid recipient email address.")
             else:
@@ -331,114 +380,10 @@ def show_outreach_form(user_id, business_name, health_score):
                     st.error(f"Could not send email: {e}")
 
 
-# ------------------------- Bulk audit mode -------------------------
-
-def run_single_audit(business_query, places_api_key, pagespeed_api_key):
-    """Runs a full audit for one business query string, returns a flat dict or None."""
-    results = text_search(business_query, places_api_key)
-    if not results:
-        return None
-    place_id = results[0]["place_id"]
-    details = get_place_details(place_id, places_api_key)
-    website = details.get("website", "")
-    pagespeed = get_pagespeed_scores(website, pagespeed_api_key) if website else {}
-    onpage = check_onpage_basics(website) if website else {}
-    health_score = compute_health_score(details, pagespeed, onpage)
-    return {
-        "Business Name": details.get("name", ""),
-        "Address": details.get("formatted_address", ""),
-        "Phone": details.get("formatted_phone_number", ""),
-        "Website": website,
-        "Rating": details.get("rating", ""),
-        "Reviews": details.get("user_ratings_total", ""),
-        "Health Score": health_score,
-    }
-
-
-def show_bulk_audit(user, places_api_key, pagespeed_api_key):
-    st.title("📦 Bulk Audit Mode")
-    st.caption("Upload a CSV of businesses (e.g. from your Lead Generation tool) and audit them all at once.")
-
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
-    if not uploaded:
-        st.info("CSV should have at least a business name column. A location/address column and an email column are optional but recommended.")
-        return
-
-    df_input = pd.read_csv(uploaded)
-    st.write("Preview:")
-    st.dataframe(df_input.head(), use_container_width=True)
-
-    cols = list(df_input.columns)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        name_col = st.selectbox("Business name column", cols)
-    with col2:
-        location_col = st.selectbox("Location column (optional)", ["(none)"] + cols)
-    with col3:
-        email_col = st.selectbox("Email column (optional, for outreach)", ["(none)"] + cols)
-
-    max_rows = st.slider("How many rows to audit (limits API usage)", 1, min(50, len(df_input)), min(10, len(df_input)))
-
-    if st.button("🚀 Run Bulk Audit", type="primary"):
-        if not places_api_key:
-            st.error("Please enter your Google Places API key in the sidebar.")
-            return
-
-        rows_to_process = df_input.head(max_rows)
-        progress = st.progress(0.0, text="Starting...")
-        results = []
-        for i, row in rows_to_process.iterrows():
-            name = str(row[name_col])
-            location = str(row[location_col]) if location_col != "(none)" else ""
-            query = f"{name} {location}".strip()
-            try:
-                result = run_single_audit(query, places_api_key, pagespeed_api_key)
-            except Exception:
-                result = None
-            if result:
-                if email_col != "(none)":
-                    result["Email"] = row.get(email_col, "")
-                results.append(result)
-            progress.progress((i + 1) / len(rows_to_process), text=f"Audited {i + 1}/{len(rows_to_process)}")
-        progress.empty()
-
-        if not results:
-            st.warning("No results. Check your API key or column selection.")
-            return
-
-        df_results = pd.DataFrame(results)
-        st.session_state["bulk_results"] = df_results
-        st.success(f"Audited {len(df_results)} businesses!")
-
-    df_results = st.session_state.get("bulk_results")
-    if df_results is not None:
-        st.dataframe(df_results, use_container_width=True)
-        csv = df_results.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Download Bulk Report (CSV)", data=csv, file_name="bulk_audit_report.csv", mime="text/csv")
-
-        if "Email" in df_results.columns:
-            st.divider()
-            st.subheader("📤 Bulk Outreach")
-            threshold = st.slider("Send outreach to businesses with score below:", 0, 100, 60)
-            low_score = df_results[(df_results["Health Score"] < threshold) & (df_results["Email"].notna()) & (df_results["Email"] != "")]
-            st.write(f"{len(low_score)} businesses match (score below {threshold} and have an email).")
-            if len(low_score) > 0 and st.button(f"Send outreach email to all {len(low_score)} businesses"):
-                sent_count = 0
-                for _, row in low_score.iterrows():
-                    subject, body = default_email_template(row["Business Name"], row["Health Score"])
-                    try:
-                        send_email_smtp(row["Email"], subject, body)
-                        log_outreach_email(user.id, row["Business Name"], row["Email"], subject, body, row["Health Score"])
-                        sent_count += 1
-                    except Exception:
-                        pass
-                st.success(f"Sent {sent_count}/{len(low_score)} outreach emails. Check the Outreach Log tab.")
-
-
 # ------------------------- Outreach log screen -------------------------
 
 def show_outreach_log(user_id):
-    st.title("📋 Outreach Log")
+    st.title("Outreach Log")
     st.caption("Every email you've sent. Update the status as you hear back.")
 
     resp = supabase.table("outreach_emails").select("*").eq("user_id", user_id).order("sent_at", desc=True).execute()
@@ -472,11 +417,107 @@ def show_outreach_log(user_id):
                     st.rerun()
 
 
+# ------------------------- Bulk audit mode -------------------------
+
+def run_single_audit(business_query, pagespeed_api_key):
+    results = search_business(business_query, max_results=1)
+    if not results:
+        return None
+    business = parse_business_result(results[0])
+    website = business.get("website", "")
+    pagespeed = get_pagespeed_scores(website, pagespeed_api_key) if website else {}
+    onpage = check_onpage_basics(website) if website else {}
+    health_score = compute_health_score(business, pagespeed, onpage)
+    return {
+        "Business Name": business.get("name", ""),
+        "Address": business.get("formatted_address", ""),
+        "Phone": business.get("phone", ""),
+        "Website": website,
+        "Health Score": health_score,
+    }
+
+
+def show_bulk_audit(user, pagespeed_api_key):
+    st.title("Bulk Audit Mode")
+    st.caption("Upload a CSV of businesses and audit them all at once. Uses the free OpenStreetMap data source.")
+
+    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    if not uploaded:
+        st.info("CSV should have at least a business name column. A location column and an email column are optional but recommended.")
+        return
+
+    df_input = pd.read_csv(uploaded)
+    st.write("Preview:")
+    st.dataframe(df_input.head(), use_container_width=True)
+
+    cols = list(df_input.columns)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        name_col = st.selectbox("Business name column", cols)
+    with col2:
+        location_col = st.selectbox("Location column (optional)", ["(none)"] + cols)
+    with col3:
+        email_col = st.selectbox("Email column (optional, for outreach)", ["(none)"] + cols)
+
+    max_rows = st.slider("How many rows to audit", 1, min(50, len(df_input)), min(10, len(df_input)))
+
+    if st.button("Run Bulk Audit", type="primary"):
+        rows_to_process = df_input.head(max_rows)
+        progress = st.progress(0.0, text="Starting...")
+        results = []
+        for i, row in rows_to_process.iterrows():
+            name = str(row[name_col])
+            location = str(row[location_col]) if location_col != "(none)" else ""
+            query = f"{name} {location}".strip()
+            try:
+                result = run_single_audit(query, pagespeed_api_key)
+            except Exception:
+                result = None
+            if result:
+                if email_col != "(none)":
+                    result["Email"] = row.get(email_col, "")
+                results.append(result)
+            progress.progress((i + 1) / len(rows_to_process), text=f"Audited {i + 1}/{len(rows_to_process)}")
+        progress.empty()
+
+        if not results:
+            st.warning("No results. Try different column selections or a smaller/cleaner list.")
+            return
+
+        df_results = pd.DataFrame(results)
+        st.session_state["bulk_results"] = df_results
+        st.success(f"Audited {len(df_results)} businesses!")
+
+    df_results = st.session_state.get("bulk_results")
+    if df_results is not None:
+        st.dataframe(df_results, use_container_width=True)
+        csv = df_results.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("Download Bulk Report (CSV)", data=csv, file_name="bulk_audit_report.csv", mime="text/csv")
+
+        if "Email" in df_results.columns:
+            st.divider()
+            st.subheader("Bulk Outreach")
+            threshold = st.slider("Send outreach to businesses with score below:", 0, 100, 60)
+            low_score = df_results[(df_results["Health Score"] < threshold) & (df_results["Email"].notna()) & (df_results["Email"] != "")]
+            st.write(f"{len(low_score)} businesses match (score below {threshold} and have an email).")
+            if len(low_score) > 0 and st.button(f"Send outreach email to all {len(low_score)} businesses"):
+                sent_count = 0
+                for _, row in low_score.iterrows():
+                    subject, body = default_email_template(row["Business Name"], row["Health Score"])
+                    try:
+                        send_email_smtp(row["Email"], subject, body)
+                        log_outreach_email(user.id, row["Business Name"], row["Email"], subject, body, row["Health Score"])
+                        sent_count += 1
+                    except Exception:
+                        pass
+                st.success(f"Sent {sent_count}/{len(low_score)} outreach emails. Check the Outreach Log tab.")
+
+
 # ------------------------- Main audit tool screen -------------------------
 
 def show_audit_tool(user, access_label):
     with st.sidebar:
-        st.success(f"✅ Logged in as **{user.email}**")
+        st.success(f"Logged in as **{user.email}**")
         st.caption(f"Plan status: {access_label}")
         views = ["Audit Tool", "Bulk Audit", "Outreach Log"]
         st.session_state.view = st.radio("View", views, index=views.index(st.session_state.view) if st.session_state.view in views else 0)
@@ -486,32 +527,29 @@ def show_audit_tool(user, access_label):
             st.rerun()
         st.divider()
         st.header("Settings")
-        places_api_key = st.text_input("Google Places API Key", type="password")
-        pagespeed_api_key = st.text_input("PageSpeed API Key (optional)", type="password")
+        st.caption("Business search uses the free OpenStreetMap data source — no key needed.")
+        pagespeed_api_key = st.text_input("PageSpeed API Key (optional, free)", type="password")
 
     if st.session_state.view == "Outreach Log":
         show_outreach_log(user.id)
         return
 
     if st.session_state.view == "Bulk Audit":
-        show_bulk_audit(user, places_api_key, pagespeed_api_key)
+        show_bulk_audit(user, pagespeed_api_key)
         return
 
-    st.title("🏪 Local Business Audit Tool")
-    st.caption("Google Places + PageSpeed Insights (official APIs) — Local SEO Health Score.")
+    st.title("Local Business Audit Tool")
+    st.caption("Free business search (OpenStreetMap) + website health check — no billing required.")
 
-    query = st.text_input("Business name + location", placeholder="e.g. Starbucks, New York")
-    run = st.button("🔍 Run Audit", type="primary")
+    query = st.text_input("Business name + location", placeholder="e.g. Joe's Pizza, Brooklyn")
+    run = st.button("Run Audit", type="primary")
 
     if run:
-        if not places_api_key:
-            st.error("Please enter your Google Places API key in the sidebar.")
-        elif not query:
+        if not query:
             st.error("Please enter a business name and location.")
         else:
             with st.spinner("Searching for the business..."):
-                results = text_search(query, places_api_key)
-
+                results = search_business(query)
             if not results:
                 st.warning("No results found. Try a different name or location.")
             else:
@@ -519,26 +557,27 @@ def show_audit_tool(user, access_label):
 
     results = st.session_state.get("last_results")
     if results:
-        options = {f"{r['name']} — {r.get('formatted_address', '')}": r["place_id"] for r in results[:5]}
+        options = {}
+        for r in results[:5]:
+            b = parse_business_result(r)
+            options[f"{b['name']} — {b['formatted_address'][:60]}"] = b
         chosen_label = st.selectbox("Select the correct business:", list(options.keys()))
-        place_id = options[chosen_label]
+        business = options[chosen_label]
 
         if st.button("Run Full Audit on Selected Business"):
-            places_api_key_local = places_api_key
             with st.spinner("Running full audit..."):
-                details = get_place_details(place_id, places_api_key_local)
-                website = details.get("website", "")
+                website = business.get("website", "")
                 pagespeed = get_pagespeed_scores(website, pagespeed_api_key) if website else {}
                 onpage = check_onpage_basics(website) if website else {}
-                health_score = compute_health_score(details, pagespeed, onpage)
+                health_score = compute_health_score(business, pagespeed, onpage)
             st.session_state["last_audit"] = {
-                "details": details, "website": website, "pagespeed": pagespeed,
+                "business": business, "website": website, "pagespeed": pagespeed,
                 "onpage": onpage, "health_score": health_score,
             }
 
     audit = st.session_state.get("last_audit")
     if audit:
-        details = audit["details"]
+        business = audit["business"]
         website = audit["website"]
         pagespeed = audit["pagespeed"]
         onpage = audit["onpage"]
@@ -546,65 +585,70 @@ def show_audit_tool(user, access_label):
 
         col1, col2 = st.columns([1, 2])
         with col1:
-            st.metric("Local SEO Health Score", f"{health_score}/100")
+            st.markdown(
+                f"""<div class="score-card">
+                <div style="font-size:0.85rem;color:#6B7280;">Health Score</div>
+                <div class="score-number {score_color_class(health_score)}">{health_score}</div>
+                <div style="font-size:0.85rem;color:#6B7280;">out of 100</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
         with col2:
-            st.write(f"**{details.get('name', '')}**")
-            st.write(details.get("formatted_address", ""))
-            st.write(f"⭐ {details.get('rating', 'N/A')} ({details.get('user_ratings_total', 0)} reviews)")
+            st.write(f"**{business.get('name', '')}**")
+            st.write(business.get("formatted_address", ""))
 
         st.divider()
-        st.subheader("📍 Google Business Profile")
-        gbp_rows = [
-            ("Website listed", "✅" if details.get("website") else "❌"),
-            ("Phone number listed", "✅" if details.get("formatted_phone_number") else "❌"),
-            ("Opening hours set", "✅" if details.get("opening_hours") else "❌"),
-            ("Rating ≥ 4.0", "✅" if details.get("rating", 0) >= 4.0 else "❌"),
+        st.subheader("Business Listing")
+        listing_rows = [
+            ("Website listed", "Yes" if business.get("website") else "No"),
+            ("Phone number listed", "Yes" if business.get("phone") else "No"),
+            ("Opening hours set", "Yes" if business.get("opening_hours") else "No"),
         ]
-        st.table(pd.DataFrame(gbp_rows, columns=["Check", "Status"]))
+        st.table(pd.DataFrame(listing_rows, columns=["Check", "Status"]))
 
         if website:
-            st.subheader("🌐 Website Technical Health")
+            st.subheader("Website Technical Health")
             ps_cols = st.columns(4)
             labels = {"performance": "Performance", "seo": "SEO", "accessibility": "Accessibility", "best_practices": "Best Practices"}
             for i, key in enumerate(["performance", "seo", "accessibility", "best_practices"]):
                 val = pagespeed.get(key)
                 ps_cols[i].metric(labels[key], f"{val}/100" if val is not None else "N/A")
 
-            st.subheader("🔎 On-Page Basics")
+            st.subheader("On-Page Basics")
             onpage_rows = [
-                ("HTTPS (secure)", "✅" if onpage.get("https") else "❌"),
-                ("Title tag present", "✅" if onpage.get("title_tag") else "❌"),
-                ("Meta description present", "✅" if onpage.get("meta_description") else "❌"),
-                ("Mobile-friendly viewport tag", "✅" if onpage.get("mobile_viewport") else "❌"),
+                ("HTTPS (secure)", "Yes" if onpage.get("https") else "No"),
+                ("Title tag present", "Yes" if onpage.get("title_tag") else "No"),
+                ("Meta description present", "Yes" if onpage.get("meta_description") else "No"),
+                ("Mobile-friendly viewport tag", "Yes" if onpage.get("mobile_viewport") else "No"),
             ]
             st.table(pd.DataFrame(onpage_rows, columns=["Check", "Status"]))
         else:
-            st.warning("This business's website is not listed on Google — that's a great opportunity to pitch them!")
+            st.warning("This business doesn't have a website listed — that's a great opportunity to pitch them!")
 
         st.divider()
         report_data = {
-            "Business Name": [details.get("name", "")],
-            "Address": [details.get("formatted_address", "")],
-            "Phone": [details.get("formatted_phone_number", "")],
+            "Business Name": [business.get("name", "")],
+            "Address": [business.get("formatted_address", "")],
+            "Phone": [business.get("phone", "")],
             "Website": [website],
-            "Rating": [details.get("rating", "")],
-            "Reviews": [details.get("user_ratings_total", "")],
             "Health Score": [health_score],
         }
         df_report = pd.DataFrame(report_data)
         csv = df_report.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Download Audit Report (CSV)", data=csv,
-                            file_name=f"audit_{details.get('name', 'business').replace(' ', '_')}.csv",
+        st.download_button("Download Audit Report (CSV)", data=csv,
+                            file_name=f"audit_{business.get('name', 'business').replace(' ', '_')}.csv",
                             mime="text/csv")
 
         st.divider()
-        show_outreach_form(user.id, details.get("name", "this business"), health_score)
+        show_outreach_form(user.id, business.get("name", "this business"), health_score)
 
 
 # ------------------------- Main -------------------------
 
+inject_custom_css()
+
 if supabase is None:
-    st.error("⚠️ Supabase is not configured. Please check your secrets.")
+    st.error("Supabase is not configured. Please check your secrets.")
     st.stop()
 
 if st.session_state.user is None:
